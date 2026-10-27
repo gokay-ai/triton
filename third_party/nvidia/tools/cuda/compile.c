@@ -64,6 +64,8 @@ CUresult {kernel_name}(CUstream stream, {signature}) {{
     CUdeviceptr profile_scratch = 0;
     void *args[{num_args}] = {{ {arg_pointers} }};
     // TODO: shared memory
-    if(gX * gY * gZ > 0)
-      return cuLaunchKernel({kernel_name}_func, gX, gY, gZ, {num_warps} * {warp_size}, 1, 1, {shared}, stream, args, NULL);
+    // An empty grid launches nothing, matching the JIT launcher.
+    if(gX * gY * gZ == 0)
+      return CUDA_SUCCESS;
+    return cuLaunchKernel({kernel_name}_func, gX, gY, gZ, {num_warps} * {warp_size}, 1, 1, {shared}, stream, args, NULL);
 }}

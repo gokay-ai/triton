@@ -567,6 +567,87 @@ def test_launcher_has_no_available_kernel():
         assert "kernel launch failed" in result.stderr
 
 
+zero_grid_kernel_src = """
+import triton
+import triton.language as tl
+
+@triton.jit
+def kernel(X, N):
+    tl.store(X + tl.program_id(0), N)
+"""
+
+
+def test_launch_empty_grid():
+    # A zero-sized grid is a successful no-op in the JIT launcher; the AOT entry point should agree.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        kernel_path = os.path.join(tmp_dir, "kernel.py")
+        with open(kernel_path, "w") as file:
+            file.write(zero_grid_kernel_src)
+        _compile_kernel(dir=tmp_dir, signature="*i32:16, i32", kernel_name="kernel", out_name="zero_grid",
+                        out_path="zero_grid", num_warps=1, grid="N,1,1", kernel_path=kernel_path)
+
+        (header, ) = glob.glob(os.path.join(tmp_dir, "zero_grid.*.h"))
+        with open(header) as file:
+            (func_name, ) = re.findall(r"\b(zero_grid_\w+)\(\w+ stream,", file.read())
+
+        if is_cuda():
+            main_src = f"""
+// Forward declaration for backward compatibility with CUDA 12.x and 13.x
+CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
+
+int main() {{
+  CUdevice dev;
+  CUcontext ctx;
+  CUstream stream;
+  CUdeviceptr X;
+  cuInit(0);
+  cuDeviceGet(&dev, 0);
+  cuCtxCreate_v2(&ctx, 0, dev);
+  cuStreamCreate(&stream, 0);
+  cuMemAlloc(&X, 4);
+  CUresult ret = {func_name}(stream, X, 0);
+  cuMemFree(X);
+  cuCtxDestroy(ctx);
+  return ret == CUDA_SUCCESS ? 0 : 1;
+}}
+"""
+        elif is_hip():
+            main_src = f"""
+int main() {{
+  hipDevice_t dev;
+  hipStream_t stream;
+  hipDeviceptr_t X;
+  hipInit(0);
+  hipDeviceGet(&dev, 0);
+  hipStreamCreateWithFlags(&stream, 0);
+  hipMalloc(&X, 4);
+  hipError_t ret = {func_name}(stream, X, 0);
+  hipFree(X);
+  return ret == hipSuccess ? 0 : 1;
+}}
+"""
+        with open(os.path.join(tmp_dir, "test.c"), "w") as file:
+            file.write(f'#include "{os.path.basename(header)}"\n' + main_src)
+
+        (source, ) = glob.glob(os.path.join(tmp_dir, "zero_grid.*.c"))
+        command = ["gcc", "-Werror=return-type", "test.c", source]
+        for inc_dir in include_dirs:
+            command.extend(["-I", inc_dir])
+        for lib_dir in library_dirs():
+            command.extend(["-L", lib_dir])
+            if is_hip():
+                command.append(f"-Wl,-rpath,{lib_dir}")
+        for lib_name in library_names():
+            if os.path.isabs(lib_name):
+                command.append(lib_name)
+            else:
+                command.extend(["-l", lib_name])
+        command.extend(["-o", "test"])
+        subprocess.run(command, check=True, cwd=tmp_dir)
+
+        subprocess.run(["./test"], check=True, cwd=tmp_dir)
+
+
 def test_compile_link_autotune_matmul():
     np.random.seed(3)
 
